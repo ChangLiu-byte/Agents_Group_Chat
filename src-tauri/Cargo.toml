@@ -22,7 +22,11 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
+# Phase 2: agent config CRUD storage
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "tls-rustls"] }
+tokio = { version = "1", features = ["full"] }
+keyring = { version = "3", features = ["windows-native"] }  # 用来把 API key 存进系统凭据管理器，而不是明文进数据库
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
@@ -31,10 +35,3 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
-
-
-[dependencies]
-tauri-plugin-sql = { version = "2", features = ["sqlite"] }
-keyring = "3"  # 用来把 API key 存进系统凭据管理器，而不是明文进数据库
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"

@@ -1,49 +1,127 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
+import { AgentForm } from "./components/AgentForm";
+import { AgentCard } from "./components/AgentCard";
+import {
+  agentToFormValues,
+  emptyFormValues,
+  type Agent,
+  type AgentFormValues,
+} from "./types/agent";
+
+type FormMode = { kind: "closed" } | { kind: "add" } | { kind: "edit"; agent: Agent };
 
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [formMode, setFormMode] = useState<FormMode>({ kind: "closed" });
+  const [error, setError] = useState<string | null>(null);
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+  async function refresh() {
+    try {
+      const result = await invoke<Agent[]>("list_agents");
+      setAgents(result);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  async function handleSubmit(values: AgentFormValues) {
+    try {
+      if (formMode.kind === "edit") {
+        const agent: Agent = {
+          id: values.id,
+          name: values.name,
+          provider: values.provider,
+          model: values.model,
+          system_prompt: values.system_prompt || null,
+          temperature: values.temperature,
+          color: values.color || null,
+          created_at: formMode.agent.created_at,
+        };
+        await invoke("update_agent", {
+          agent,
+          apiKey: values.api_key ? values.api_key : null,
+        });
+      } else {
+        const agent: Agent = {
+          id: crypto.randomUUID(),
+          name: values.name,
+          provider: values.provider,
+          model: values.model,
+          system_prompt: values.system_prompt || null,
+          temperature: values.temperature,
+          color: values.color || null,
+          created_at: Math.floor(Date.now() / 1000),
+        };
+        await invoke("add_agent", { agent, apiKey: values.api_key });
+      }
+      setFormMode({ kind: "closed" });
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleDelete(agent: Agent) {
+    if (!confirm(`删除 Agent "${agent.name}"？此操作无法撤销。`)) return;
+    try {
+      await invoke("delete_agent", { id: agent.id });
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
+    <main className="mx-auto max-w-3xl px-4 py-8 space-y-6">
+      <header className="flex items-center justify-between">
+        <h1 className="text-xl font-bold text-slate-900">Agent 配置</h1>
+        {formMode.kind === "closed" && (
+          <button
+            onClick={() => setFormMode({ kind: "add" })}
+            className="rounded-md bg-indigo-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-indigo-500"
+          >
+            + 新增 Agent
+          </button>
+        )}
+      </header>
 
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
+      {error && (
+        <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {error}
+        </div>
+      )}
 
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
+      {formMode.kind !== "closed" && (
+        <AgentForm
+          key={formMode.kind === "edit" ? formMode.agent.id : "new"}
+          initialValues={
+            formMode.kind === "edit" ? agentToFormValues(formMode.agent) : emptyFormValues()
+          }
+          isEditing={formMode.kind === "edit"}
+          onSubmit={handleSubmit}
+          onCancel={() => setFormMode({ kind: "closed" })}
         />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
+      )}
+
+      <section className="space-y-2">
+        {agents.length === 0 && (
+          <p className="text-sm text-slate-500">还没有配置任何 Agent。</p>
+        )}
+        {agents.map((agent) => (
+          <AgentCard
+            key={agent.id}
+            agent={agent}
+            onEdit={(a) => setFormMode({ kind: "edit", agent: a })}
+            onDelete={handleDelete}
+          />
+        ))}
+      </section>
     </main>
   );
 }
