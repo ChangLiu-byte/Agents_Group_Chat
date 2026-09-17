@@ -11,7 +11,7 @@ export interface Agent {
   created_at: number;
 }
 
-export const PROVIDERS = ["openai", "anthropic", "deepseek"] as const;
+export const PROVIDERS = ["openai", "anthropic", "deepseek", "qwen"] as const;
 export type Provider = (typeof PROVIDERS)[number];
 
 /** Shape of the form while the user is editing it (before it becomes an `Agent`). */

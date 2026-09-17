@@ -29,6 +29,12 @@ pub fn save_api_key(agent_id: &str, api_key: &str) -> Result<(), String> {
     entry.set_password(api_key).map_err(|e| e.to_string())
 }
 
+/// Load the stored API key for the given agent id.
+pub fn load_api_key(agent_id: &str) -> Result<String, String> {
+    let entry = keyring::Entry::new(SERVICE_NAME, agent_id).map_err(|e| e.to_string())?;
+    entry.get_password().map_err(|e| e.to_string())
+}
+
 /// Remove the stored API key for the given agent id, if any.
 /// Not having an entry to delete is not treated as an error.
 pub fn delete_api_key(agent_id: &str) -> Result<(), String> {

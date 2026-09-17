@@ -1,4 +1,5 @@
 use crate::agent::{self, Agent};
+use crate::providers::{self, ChatMessage, Role};
 use sqlx::SqlitePool;
 use tauri::State;
 
@@ -97,4 +98,47 @@ pub async fn delete_agent(pool: State<'_, SqlitePool>, id: String) -> Result<(),
     agent::delete_api_key(&id)?;
 
     Ok(())
+}
+
+/// Phase 3 manual-testing command: load one agent's config + API key and
+/// send it a single user message (no prior history yet - that's Phase 4),
+/// returning the provider's reply text as-is.
+#[tauri::command]
+pub async fn test_agent_message(
+    pool: State<'_, SqlitePool>,
+    client: State<'_, reqwest::Client>,
+    agent_id: String,
+    user_message: String,
+) -> Result<String, String> {
+    let agent = sqlx::query_as::<_, Agent>(
+        r#"
+        SELECT id, name, provider, model, system_prompt, temperature, color, created_at
+        FROM agents
+        WHERE id = ?
+        "#,
+    )
+    .bind(&agent_id)
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("agent {agent_id} not found"))?;
+
+    let api_key = agent::load_api_key(&agent.id)?;
+
+    let messages = [ChatMessage {
+        role: Role::User,
+        content: user_message,
+    }];
+
+    providers::send_chat_message(
+        client.inner(),
+        &agent.provider,
+        &agent.model,
+        agent.system_prompt.as_deref(),
+        &messages,
+        &api_key,
+        agent.temperature as f32,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }

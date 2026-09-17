@@ -1,6 +1,7 @@
 mod agent;
 mod commands;
 mod db;
+mod providers;
 
 use tauri::Manager;
 
@@ -21,6 +22,10 @@ pub fn run() {
                     .expect("failed to run agents table migration");
                 handle.manage(pool);
             });
+            // Shared HTTP client for all provider calls - reqwest::Client
+            // holds a connection pool internally and is meant to be reused
+            // rather than constructed per-request.
+            app.manage(reqwest::Client::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -28,6 +33,7 @@ pub fn run() {
             commands::list_agents,
             commands::update_agent,
             commands::delete_agent,
+            commands::test_agent_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

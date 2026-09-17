@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AgentForm } from "./components/AgentForm";
 import { AgentCard } from "./components/AgentCard";
+import { TestPanel } from "./components/TestPanel";
 import {
   agentToFormValues,
   emptyFormValues,
@@ -122,6 +123,8 @@ function App() {
           />
         ))}
       </section>
+
+      <TestPanel agents={agents} />
     </main>
   );
 }
