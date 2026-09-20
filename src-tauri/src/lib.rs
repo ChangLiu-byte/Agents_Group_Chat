@@ -2,6 +2,7 @@ mod agent;
 mod commands;
 mod db;
 mod providers;
+mod session;
 
 use tauri::Manager;
 
@@ -29,11 +30,19 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::add_agent,
-            commands::list_agents,
-            commands::update_agent,
-            commands::delete_agent,
-            commands::test_agent_message,
+            commands::agent::add_agent,
+            commands::agent::list_agents,
+            commands::agent::update_agent,
+            commands::agent::delete_agent,
+            commands::agent::test_agent_message,
+            commands::session::create_session,
+            commands::session::list_sessions,
+            commands::session::get_session,
+            commands::session::add_agent_to_session,
+            commands::session::remove_agent_from_session,
+            commands::session::reorder_session_agents,
+            commands::session::list_session_agents,
+            commands::session::set_session_mode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

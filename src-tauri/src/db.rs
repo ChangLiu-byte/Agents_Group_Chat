@@ -43,5 +43,55 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
     .await
     .map_err(|e| e.to_string())?;
 
+    // Phase 4: chat rooms ("sessions"), their agent roster, and messages.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            id          TEXT PRIMARY KEY NOT NULL,
+            topic       TEXT NOT NULL,
+            mode        TEXT NOT NULL DEFAULT 'sequential',
+            status      TEXT NOT NULL DEFAULT 'idle',
+            created_at  INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_agents (
+            session_id  TEXT NOT NULL,
+            agent_id    TEXT NOT NULL,
+            position    INTEGER NOT NULL,
+            PRIMARY KEY (session_id, agent_id),
+            FOREIGN KEY (session_id) REFERENCES chat_sessions(id),
+            FOREIGN KEY (agent_id) REFERENCES agents(id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS messages (
+            id            TEXT PRIMARY KEY NOT NULL,
+            session_id    TEXT NOT NULL,
+            agent_id      TEXT,
+            round_number  INTEGER NOT NULL,
+            content       TEXT NOT NULL,
+            refers_to     TEXT,
+            created_at    INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES chat_sessions(id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
     Ok(())
 }
