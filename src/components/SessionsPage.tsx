@@ -42,6 +42,18 @@ export function SessionsPage() {
     refreshSessions();
   }, []);
 
+  async function handleDelete(session: Session) {
+    if (!confirm(`删除会话 "${session.topic}"？其名单和全部聊天记录都会被删除，此操作无法撤销。`)) {
+      return;
+    }
+    try {
+      await invoke("delete_session", { sessionId: session.id });
+      await refreshSessions();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   useEffect(() => {
     if (view.kind !== "new") return;
     invoke<Agent[]>("list_agents")
@@ -97,24 +109,36 @@ export function SessionsPage() {
           <p className="text-sm text-slate-500">还没有创建任何会话。</p>
         )}
         {sessions.map((session) => (
-          <button
+          <div
             key={session.id}
-            onClick={() => setView({ kind: "detail", sessionId: session.id })}
-            className="flex w-full items-center justify-between rounded-lg border border-slate-200 bg-white p-3 text-left shadow-sm hover:border-indigo-300"
+            className="flex items-center rounded-lg border border-slate-200 bg-white shadow-sm hover:border-indigo-300"
           >
-            <div>
-              <p className="text-sm font-semibold text-slate-900">{session.topic}</p>
-              <p className="text-xs text-slate-500">{formatTimestamp(session.created_at)}</p>
-            </div>
-            <div className="flex items-center gap-2 text-xs">
-              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">
-                {modeLabel[session.mode]}
-              </span>
-              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">
-                {statusLabel[session.status]}
-              </span>
-            </div>
-          </button>
+            <button
+              onClick={() => setView({ kind: "detail", sessionId: session.id })}
+              className="flex min-w-0 flex-1 items-center justify-between gap-3 p-3 text-left"
+            >
+              <div className="min-w-0">
+                <p className="truncate text-sm font-semibold text-slate-900">{session.topic}</p>
+                <p className="text-xs text-slate-500">{formatTimestamp(session.created_at)}</p>
+              </div>
+              <div className="flex shrink-0 items-center gap-2 text-xs">
+                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">
+                  {modeLabel[session.mode]}
+                </span>
+                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">
+                  {statusLabel[session.status]}
+                </span>
+              </div>
+            </button>
+            <button
+              onClick={() => handleDelete(session)}
+              disabled={session.status === "running"}
+              title={session.status === "running" ? "会话进行中，无法删除" : "删除会话"}
+              className="mr-2 shrink-0 rounded-md px-3 py-1 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-30 disabled:hover:bg-transparent"
+            >
+              删除
+            </button>
+          </div>
         ))}
       </section>
     </div>

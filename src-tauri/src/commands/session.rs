@@ -176,6 +176,51 @@ pub async fn list_session_agents(
     .map_err(|e| e.to_string())
 }
 
+/// Delete a session together with its roster and message history. Refused
+/// while the session is "running" so an in-flight round can't be left
+/// inserting messages for a session that no longer exists.
+#[tauri::command]
+pub async fn delete_session(
+    pool: State<'_, SqlitePool>,
+    session_id: String,
+) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM chat_sessions WHERE id = ?")
+        .bind(&session_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match status.as_deref() {
+        None => return Err(format!("session {session_id} not found")),
+        Some("running") => return Err("session is running, cannot delete it right now".to_string()),
+        Some(_) => {}
+    }
+
+    // SQLite foreign keys aren't enforced (and have no ON DELETE CASCADE in
+    // the schema), so children are deleted explicitly, child-first.
+    sqlx::query("DELETE FROM messages WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM session_agents WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM chat_sessions WHERE id = ?")
+        .bind(&session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 /// Switch a session between "sequential" and "mention" scheduling. Mention
 /// mode's actual turn-taking logic isn't implemented yet - this only
 /// persists the flag so the UI can be built against it now.

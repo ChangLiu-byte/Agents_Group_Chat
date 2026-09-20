@@ -43,6 +43,7 @@ pub fn run() {
             commands::session::reorder_session_agents,
             commands::session::list_session_agents,
             commands::session::set_session_mode,
+            commands::session::delete_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
