@@ -21,6 +21,9 @@ pub fn run() {
                 db::run_migrations(&pool)
                     .await
                     .expect("failed to run agents table migration");
+                db::reset_stale_running_sessions(&pool)
+                    .await
+                    .expect("failed to reset interrupted sessions");
                 handle.manage(pool);
             });
             // Shared HTTP client for all provider calls - reqwest::Client
@@ -44,6 +47,8 @@ pub fn run() {
             commands::session::list_session_agents,
             commands::session::set_session_mode,
             commands::session::delete_session,
+            commands::chat::list_messages,
+            commands::chat::run_sequential_round,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

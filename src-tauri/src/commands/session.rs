@@ -1,16 +1,8 @@
 use crate::agent::Agent;
-use crate::session::Session;
+use crate::session::{now_unix, Session};
 use sqlx::SqlitePool;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::State;
 use uuid::Uuid;
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before the unix epoch")
-        .as_secs() as i64
-}
 
 /// Create a new chat room. Mode defaults to "sequential", status to "idle";
 /// the agent roster starts empty (see [`add_agent_to_session`]).
@@ -62,6 +54,10 @@ pub async fn list_sessions(pool: State<'_, SqlitePool>) -> Result<Vec<Session>, 
 /// (e.g. after switching mode) without re-fetching the whole list.
 #[tauri::command]
 pub async fn get_session(pool: State<'_, SqlitePool>, session_id: String) -> Result<Session, String> {
+    fetch_session(pool.inner(), &session_id).await
+}
+
+pub(crate) async fn fetch_session(pool: &SqlitePool, session_id: &str) -> Result<Session, String> {
     sqlx::query_as::<_, Session>(
         r#"
         SELECT id, topic, mode, status, created_at
@@ -69,8 +65,8 @@ pub async fn get_session(pool: State<'_, SqlitePool>, session_id: String) -> Res
         WHERE id = ?
         "#,
     )
-    .bind(&session_id)
-    .fetch_optional(pool.inner())
+    .bind(session_id)
+    .fetch_optional(pool)
     .await
     .map_err(|e| e.to_string())?
     .ok_or_else(|| format!("session {session_id} not found"))
@@ -161,6 +157,10 @@ pub async fn list_session_agents(
     pool: State<'_, SqlitePool>,
     session_id: String,
 ) -> Result<Vec<Agent>, String> {
+    fetch_roster(pool.inner(), &session_id).await
+}
+
+pub(crate) async fn fetch_roster(pool: &SqlitePool, session_id: &str) -> Result<Vec<Agent>, String> {
     sqlx::query_as::<_, Agent>(
         r#"
         SELECT a.id, a.name, a.provider, a.model, a.system_prompt, a.temperature, a.color, a.created_at
@@ -170,8 +170,8 @@ pub async fn list_session_agents(
         ORDER BY sa.position ASC
         "#,
     )
-    .bind(&session_id)
-    .fetch_all(pool.inner())
+    .bind(session_id)
+    .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())
 }

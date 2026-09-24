@@ -36,9 +36,15 @@ struct ChatResponse {
     content: Vec<ContentBlock>,
 }
 
+// The response `content` array can also hold non-text blocks (e.g. a
+// "thinking" block, which has no `text` field, ahead of the actual answer),
+// so only blocks of type "text" are read.
 #[derive(Deserialize)]
 struct ContentBlock {
-    text: String,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 fn role_str(role: Role) -> &'static str {
@@ -98,10 +104,17 @@ pub async fn send(
     let parsed: ChatResponse =
         serde_json::from_str(&raw_body).map_err(|e| ProviderError::Parse(e.to_string()))?;
 
-    parsed
+    let text: Vec<String> = parsed
         .content
         .into_iter()
-        .next()
-        .map(|block| block.text)
-        .ok_or_else(|| ProviderError::Parse("response had no content blocks".to_string()))
+        .filter(|block| block.kind == "text")
+        .filter_map(|block| block.text)
+        .collect();
+
+    if text.is_empty() {
+        return Err(ProviderError::Parse(
+            "response had no text content block".to_string(),
+        ));
+    }
+    Ok(text.join("\n\n"))
 }

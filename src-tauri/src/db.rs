@@ -21,6 +21,17 @@ pub async fn init_pool(app: &AppHandle) -> Result<SqlitePool, String> {
         .map_err(|e| e.to_string())
 }
 
+/// No round can be in flight when the process has just started, so any
+/// session still marked "running" was interrupted by a crash/kill. Without
+/// this it would stay locked (can't send, can't delete) forever.
+pub async fn reset_stale_running_sessions(pool: &SqlitePool) -> Result<(), String> {
+    sqlx::query("UPDATE chat_sessions SET status = 'awaiting_user' WHERE status = 'running'")
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Create the `agents` table on startup if it doesn't already exist.
 /// Simple "migrate on launch" approach - fine for a single-table app like
 /// this; can be swapped for `sqlx::migrate!` later if the schema grows.
