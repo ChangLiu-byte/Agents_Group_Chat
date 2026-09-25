@@ -14,6 +14,33 @@ const USER_LABEL: &str = "User";
 /// Label for a message whose author has since been deleted from `agents`.
 const REMOVED_AGENT_LABEL: &str = "已移除的Agent";
 
+/// Appended to each agent's own system prompt while the session is in
+/// sequential ("小组发言") mode, so replies stay short enough to read as a
+/// live back-and-forth instead of everyone dumping an essay in turn.
+const SEQUENTIAL_MODE_GUIDELINES: &str = "\
+You are in a group discussion round. Follow these rules:
+- Keep your reply under ~150 words. State your core judgment and reasoning directly - skip pleasantries and don't restate what's already been said.
+- If your view is basically the same as an earlier speaker's, just say in one sentence which specific point of theirs you agree with - don't re-argue the whole thing.
+- If you have different opinions, point out things you disagree with and explain the reason.
+- Don't summarize or restate the question itself.
+- If the topic deserves deeper analysis than fits here, just note that there's room to go deeper, so the user can call on you directly to expand later.";
+
+/// The system prompt actually sent for one turn: the agent's own prompt
+/// (unmodified) plus the sequential-mode guidelines, only while the session
+/// is in sequential mode. Mention mode's turn-taking isn't built yet, so
+/// this only ever fires today - but it's gated on `mode` rather than
+/// unconditional so it doesn't silently start applying there too once it
+/// is built.
+fn effective_system_prompt(agent: &Agent, mode: &str) -> Option<String> {
+    if mode != "sequential" {
+        return agent.system_prompt.clone();
+    }
+    Some(match agent.system_prompt.as_deref() {
+        Some(base) => format!("{base}\n\n{SEQUENTIAL_MODE_GUIDELINES}"),
+        None => SEQUENTIAL_MODE_GUIDELINES.to_string(),
+    })
+}
+
 /// Payload of the `agent-error` event: one agent's turn failed, so the round
 /// moves on without a reply from it. Never persisted to `messages`.
 #[derive(Clone, Serialize)]
@@ -158,17 +185,19 @@ fn strip_self_label(reply: &str, agent_name: &str) -> String {
 async fn generate_reply(
     client: &reqwest::Client,
     agent: &Agent,
+    mode: &str,
     history: &[Message],
     agent_names: &HashMap<String, String>,
 ) -> Result<String, String> {
     let api_key = agent::load_api_key(&agent.id)?;
     let chat_messages = build_history_for(&agent.id, history, agent_names);
+    let system_prompt = effective_system_prompt(agent, mode);
 
     let reply = providers::send_chat_message(
         client,
         &agent.provider,
         &agent.model,
-        agent.system_prompt.as_deref(),
+        system_prompt.as_deref(),
         &chat_messages,
         &api_key,
         agent.temperature as f32,
@@ -196,6 +225,7 @@ async fn run_round(
     client: &reqwest::Client,
     app: &AppHandle,
     session_id: &str,
+    mode: &str,
     user_message: &str,
     roster: &[Agent],
 ) -> Result<(), String> {
@@ -217,7 +247,7 @@ async fn run_round(
     for agent in roster {
         let history = fetch_messages(pool, session_id).await?;
 
-        match generate_reply(client, agent, &history, &agent_names).await {
+        match generate_reply(client, agent, mode, &history, &agent_names).await {
             Ok(reply) => {
                 let row =
                     insert_message(pool, session_id, Some(&agent.id), round_number, &reply).await?;
@@ -296,6 +326,7 @@ pub async fn run_sequential_round(
         client.inner(),
         &app_handle,
         &session_id,
+        &session.mode,
         user_message,
         &roster,
     )
@@ -338,6 +369,19 @@ mod tests {
         }
     }
 
+    fn agent(system_prompt: Option<&str>) -> Agent {
+        Agent {
+            id: "a1".into(),
+            name: "Alice".into(),
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            system_prompt: system_prompt.map(str::to_string),
+            temperature: 0.7,
+            color: None,
+            created_at: 0,
+        }
+    }
+
     fn names() -> HashMap<String, String> {
         HashMap::from([
             ("a1".to_string(), "Alice".to_string()),
@@ -370,6 +414,28 @@ mod tests {
         let history = [msg(Some("gone"), "hello")];
         let out = build_history_for("a1", &history, &names());
         assert_eq!(out[0].content, format!("[{REMOVED_AGENT_LABEL}]: hello"));
+    }
+
+    #[test]
+    fn sequential_mode_appends_guidelines_after_existing_prompt() {
+        let result = effective_system_prompt(&agent(Some("You are a pirate.")), "sequential").unwrap();
+        assert!(result.starts_with("You are a pirate.\n\n"));
+        assert!(result.contains("group discussion round"));
+    }
+
+    #[test]
+    fn sequential_mode_with_no_own_prompt_is_just_the_guidelines() {
+        let result = effective_system_prompt(&agent(None), "sequential").unwrap();
+        assert_eq!(result, SEQUENTIAL_MODE_GUIDELINES);
+    }
+
+    #[test]
+    fn non_sequential_mode_leaves_the_prompt_untouched() {
+        assert_eq!(
+            effective_system_prompt(&agent(Some("You are a pirate.")), "mention"),
+            Some("You are a pirate.".to_string())
+        );
+        assert_eq!(effective_system_prompt(&agent(None), "mention"), None);
     }
 
     #[test]
