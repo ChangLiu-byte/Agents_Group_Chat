@@ -64,7 +64,7 @@ const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/chat/completions";
 // full request URL, not just the "base_url" Alibaba's docs refer to - it
 // must end in `/chat/completions`, not just `/compatible-mode/v1`.
 const QWEN_BASE_URL: &str =
-    "https://ws-dxasge76aqlq8gfb.us-east-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions";
+    "https://maas.qwencloudapi.com/compatible-mode/v1/chat/completions";
 
 /// Send a single chat request to whichever provider `provider` names and
 /// return the assistant's reply text.
