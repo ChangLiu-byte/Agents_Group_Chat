@@ -18,12 +18,13 @@ const REMOVED_AGENT_LABEL: &str = "已移除的Agent";
 /// sequential ("小组发言") mode, so replies stay short enough to read as a
 /// live back-and-forth instead of everyone dumping an essay in turn.
 const SEQUENTIAL_MODE_GUIDELINES: &str = "\
-You are in a group discussion round. Follow these rules:
-- Keep your reply under ~150 words. State your core judgment and reasoning directly - skip pleasantries and don't restate what's already been said.
-- If your view is basically the same as an earlier speaker's, just say in one sentence which specific point of theirs you agree with - don't re-argue the whole thing.
-- If you have different opinions, point out things you disagree with and explain the reason.
-- Don't summarize or restate the question itself.
-- If the topic deserves deeper analysis than fits here, just note that there's room to go deeper, so the user can call on you directly to expand later.";
+当前处于小组讨论轮次，请遵守：
+- 别人的发言前面会有 [名字]: 标签，你回复时不需要给自己加标签
+- 回答控制在200字以内，直接给出你的核心判断和理由，不要客套或重复前文
+- 如果你的观点与已有发言基本一致，用一句话说明“同意XX的哪个具体论点”即可，不要重新论证一遍
+- 如果前面的发言中存在遗漏的角度，或存在你不同意的地方，请明确指出并说明理由。
+- 不需要总结或复述问题本身
+- 如果这个问题需要展开详细论证，只需指出“这里有更深入的分析空间”，用户可以随后点名你详细展开";
 
 /// The system prompt actually sent for one turn: the agent's own prompt
 /// (unmodified) plus the sequential-mode guidelines, only while the session
@@ -100,6 +101,7 @@ async fn insert_message(
     agent_id: Option<&str>,
     round_number: i64,
     content: &str,
+    refers_to: Option<&str>,
 ) -> Result<Message, String> {
     let message = Message {
         id: Uuid::new_v4().to_string(),
@@ -107,7 +109,7 @@ async fn insert_message(
         agent_id: agent_id.map(str::to_string),
         round_number,
         content: content.to_string(),
-        refers_to: None,
+        refers_to: refers_to.map(str::to_string),
         created_at: now_unix(),
     };
 
@@ -220,52 +222,100 @@ async fn fetch_agent_names(pool: &SqlitePool) -> Result<HashMap<String, String>,
     Ok(rows.into_iter().collect())
 }
 
-async fn run_round(
-    pool: &SqlitePool,
-    client: &reqwest::Client,
-    app: &AppHandle,
-    session_id: &str,
-    mode: &str,
-    user_message: &str,
-    roster: &[Agent],
-) -> Result<(), String> {
-    let round_number: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(round_number), 0) + 1 FROM messages WHERE session_id = ?",
+/// Look up `target_agent_id` in the session's current roster, so a mention
+/// round can't be aimed at an agent that was since removed from it.
+fn find_mention_target<'a>(
+    roster: &'a [Agent],
+    target_agent_id: &str,
+) -> Result<&'a Agent, String> {
+    roster
+        .iter()
+        .find(|a| a.id == target_agent_id)
+        .ok_or_else(|| format!("agent {target_agent_id} is not in this session's roster"))
+}
+
+/// Check-and-set in one statement so two near-simultaneous triggers (e.g. a
+/// double click, or switching mode mid-flight) can't both start a round.
+async fn claim_running(pool: &SqlitePool, session_id: &str) -> Result<(), String> {
+    let claimed = sqlx::query(
+        "UPDATE chat_sessions SET status = 'running' WHERE id = ? AND status != 'running'",
     )
     .bind(session_id)
-    .fetch_one(pool)
+    .execute(pool)
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?
+    .rows_affected();
+    if claimed == 0 {
+        return Err("session is already running a round".to_string());
+    }
+    Ok(())
+}
 
-    let user_row = insert_message(pool, session_id, None, round_number, user_message).await?;
-    emit_event(app, "message-added", &user_row);
+async fn release_to_awaiting_user(pool: &SqlitePool, session_id: &str) -> Result<(), String> {
+    sqlx::query("UPDATE chat_sessions SET status = 'awaiting_user' WHERE id = ?")
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
 
-    let agent_names = fetch_agent_names(pool).await?;
+async fn next_round_number(pool: &SqlitePool, session_id: &str) -> Result<i64, String> {
+    sqlx::query_scalar("SELECT COALESCE(MAX(round_number), 0) + 1 FROM messages WHERE session_id = ?")
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())
+}
 
-    // Strictly one agent at a time: each one has to see what the previous
-    // one just said, so the history is re-read before every turn.
-    for agent in roster {
-        let history = fetch_messages(pool, session_id).await?;
+/// The handful of things every step of a round needs - bundled so the
+/// per-turn/per-round helpers below don't each need their own four-plus
+/// parameters just to reach the DB and emit events.
+struct RoundCtx<'a> {
+    pool: &'a SqlitePool,
+    client: &'a reqwest::Client,
+    app: &'a AppHandle,
+    session_id: &'a str,
+}
 
-        match generate_reply(client, agent, mode, &history, &agent_names).await {
-            Ok(reply) => {
-                let row =
-                    insert_message(pool, session_id, Some(&agent.id), round_number, &reply).await?;
-                emit_event(app, "message-added", &row);
-            }
-            Err(error) => {
-                emit_event(
-                    app,
-                    "agent-error",
-                    AgentErrorPayload {
-                        session_id: session_id.to_string(),
-                        round_number,
-                        agent_id: agent.id.clone(),
-                        agent_name: agent.name.clone(),
-                        error,
-                    },
-                );
-            }
+/// One agent's turn: read the latest history, ask it for a reply, and
+/// either store+emit it or (on failure) emit `agent-error` without storing
+/// anything. Shared by the sequential loop (called once per roster agent)
+/// and mention mode (called once for the mentioned agent).
+async fn run_one_turn(
+    ctx: &RoundCtx<'_>,
+    mode: &str,
+    round_number: i64,
+    agent: &Agent,
+    agent_names: &HashMap<String, String>,
+) -> Result<(), String> {
+    let history = fetch_messages(ctx.pool, ctx.session_id).await?;
+
+    match generate_reply(ctx.client, agent, mode, &history, agent_names).await {
+        Ok(reply) => {
+            let row = insert_message(
+                ctx.pool,
+                ctx.session_id,
+                Some(&agent.id),
+                round_number,
+                &reply,
+                None,
+            )
+            .await?;
+            emit_event(ctx.app, "message-added", &row);
+        }
+        Err(error) => {
+            emit_event(
+                ctx.app,
+                "agent-error",
+                AgentErrorPayload {
+                    session_id: ctx.session_id.to_string(),
+                    round_number,
+                    agent_id: agent.id.clone(),
+                    agent_name: agent.name.clone(),
+                    error,
+                },
+            );
         }
     }
 
@@ -293,6 +343,7 @@ pub async fn run_sequential_round(
     }
 
     let pool = pool.inner();
+    let client = client.inner();
 
     let session = fetch_session(pool, &session_id).await?;
     if session.mode != "sequential" {
@@ -307,38 +358,112 @@ pub async fn run_sequential_round(
         return Err("session has no agents, add at least one before sending".to_string());
     }
 
-    // Check-and-set in one statement so two near-simultaneous triggers
-    // (e.g. a double click) can't both start a round.
-    let claimed = sqlx::query(
-        "UPDATE chat_sessions SET status = 'running' WHERE id = ? AND status != 'running'",
-    )
-    .bind(&session_id)
-    .execute(pool)
-    .await
-    .map_err(|e| e.to_string())?
-    .rows_affected();
-    if claimed == 0 {
-        return Err("session is already running a round".to_string());
-    }
-
-    let outcome = run_round(
+    claim_running(pool, &session_id).await?;
+    let ctx = RoundCtx {
         pool,
-        client.inner(),
-        &app_handle,
-        &session_id,
-        &session.mode,
-        user_message,
-        &roster,
-    )
+        client,
+        app: &app_handle,
+        session_id: &session_id,
+    };
+
+    let outcome: Result<(), String> = async {
+        let round_number = next_round_number(pool, &session_id).await?;
+        let user_row =
+            insert_message(pool, &session_id, None, round_number, user_message, None).await?;
+        emit_event(&app_handle, "message-added", &user_row);
+
+        let agent_names = fetch_agent_names(pool).await?;
+
+        // Strictly one agent at a time: each one has to see what the
+        // previous one just said, so the history is re-read before every
+        // turn (inside `run_one_turn`).
+        for agent in &roster {
+            run_one_turn(&ctx, &session.mode, round_number, agent, &agent_names).await?;
+        }
+
+        Ok(())
+    }
     .await;
 
     // Leave "running" no matter how the round ended, otherwise the session
     // would stay locked.
-    let released = sqlx::query("UPDATE chat_sessions SET status = 'awaiting_user' WHERE id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string());
+    let released = release_to_awaiting_user(pool, &session_id).await;
+
+    emit_event(
+        &app_handle,
+        "round-complete",
+        RoundCompletePayload {
+            session_id: session_id.clone(),
+        },
+    );
+
+    outcome?;
+    released?;
+    Ok(())
+}
+
+/// Run one mention-mode ("点名发言") round: store the user's message with
+/// `refers_to` set to the mentioned agent, then let only that one agent
+/// reply - everyone else on the roster stays silent this round. The
+/// mentioned agent still sees the full shared transcript (including what
+/// other agents said in earlier rounds), it just doesn't get a turn of its
+/// own unless it's the one mentioned.
+#[tauri::command]
+pub async fn run_mention_round(
+    pool: State<'_, SqlitePool>,
+    client: State<'_, reqwest::Client>,
+    app_handle: AppHandle,
+    session_id: String,
+    target_agent_id: String,
+    user_message: String,
+) -> Result<(), String> {
+    let user_message = user_message.trim();
+    if user_message.is_empty() {
+        return Err("message is empty".to_string());
+    }
+
+    let pool = pool.inner();
+    let client = client.inner();
+
+    let session = fetch_session(pool, &session_id).await?;
+    if session.mode != "mention" {
+        return Err(format!(
+            "session is in \"{}\" mode, run_mention_round only works in \"mention\" mode",
+            session.mode
+        ));
+    }
+
+    let roster = fetch_roster(pool, &session_id).await?;
+    let target = find_mention_target(&roster, &target_agent_id)?.clone();
+
+    claim_running(pool, &session_id).await?;
+    let ctx = RoundCtx {
+        pool,
+        client,
+        app: &app_handle,
+        session_id: &session_id,
+    };
+
+    let outcome: Result<(), String> = async {
+        let round_number = next_round_number(pool, &session_id).await?;
+        let user_row = insert_message(
+            pool,
+            &session_id,
+            None,
+            round_number,
+            user_message,
+            Some(&target.id),
+        )
+        .await?;
+        emit_event(&app_handle, "message-added", &user_row);
+
+        let agent_names = fetch_agent_names(pool).await?;
+
+        run_one_turn(&ctx, &session.mode, round_number, &target, &agent_names).await
+    }
+    .await;
+
+    let released = release_to_awaiting_user(pool, &session_id).await;
 
     emit_event(
         &app_handle,
@@ -436,6 +561,36 @@ mod tests {
             Some("You are a pirate.".to_string())
         );
         assert_eq!(effective_system_prompt(&agent(None), "mention"), None);
+    }
+
+    fn agent_with_id(id: &str, name: &str) -> Agent {
+        Agent {
+            id: id.into(),
+            name: name.into(),
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            system_prompt: None,
+            temperature: 0.7,
+            color: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn finds_mention_target_in_roster() {
+        let roster = vec![agent_with_id("a1", "Alice"), agent_with_id("a2", "Bob")];
+        let found = find_mention_target(&roster, "a2").unwrap();
+        assert_eq!(found.name, "Bob");
+    }
+
+    #[test]
+    fn rejects_mention_target_not_in_roster() {
+        let roster = vec![agent_with_id("a1", "Alice")];
+        let err = find_mention_target(&roster, "gone").unwrap_err();
+        assert!(err.contains("gone"));
+
+        let empty: Vec<Agent> = vec![];
+        assert!(find_mention_target(&empty, "a1").is_err());
     }
 
     #[test]

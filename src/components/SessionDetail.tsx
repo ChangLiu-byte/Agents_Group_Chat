@@ -27,6 +27,7 @@ export function SessionDetail({ sessionId, onBack }: SessionDetailProps) {
   const [allAgents, setAllAgents] = useState<Agent[]>([]);
   const [items, setItems] = useState<ChatItem[]>([]);
   const [showRoster, setShowRoster] = useState(false);
+  const [mentionTargetId, setMentionTargetId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const agentsById = useMemo(() => new Map(allAgents.map((a) => [a.id, a])), [allAgents]);
@@ -78,6 +79,17 @@ export function SessionDetail({ sessionId, onBack }: SessionDetailProps) {
         setSession(sessionResult);
         setRoster(rosterResult);
         setAllAgents(agentsResult);
+
+        // Recover "who was last mentioned" from history, so reopening a
+        // mention-mode session doesn't lose the default target - only the
+        // in-progress pick (before any message has been sent with it) is
+        // ever actually lost.
+        const lastMentionTarget = [...messagesResult].reverse().find((m) => m.refers_to !== null)
+          ?.refers_to;
+        if (lastMentionTarget && rosterResult.some((a) => a.id === lastMentionTarget)) {
+          setMentionTargetId(lastMentionTarget);
+        }
+
         setItems((prev) => {
           const loaded = new Set(messagesResult.map((m) => m.id));
           const fromHistory: ChatItem[] = messagesResult.map((message) => ({
@@ -103,10 +115,23 @@ export function SessionDetail({ sessionId, onBack }: SessionDetailProps) {
   }, [sessionId]);
 
   async function handleSend(text: string) {
+    if (!session) return;
+    if (session.mode === "mention" && !mentionTargetId) {
+      setError("请先选择点名对象");
+      return;
+    }
     setError(null);
     setSession((prev) => (prev ? { ...prev, status: "running" } : prev));
     try {
-      await invoke("run_sequential_round", { sessionId, userMessage: text });
+      if (session.mode === "mention") {
+        await invoke("run_mention_round", {
+          sessionId,
+          targetAgentId: mentionTargetId,
+          userMessage: text,
+        });
+      } else {
+        await invoke("run_sequential_round", { sessionId, userMessage: text });
+      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -198,6 +223,8 @@ export function SessionDetail({ sessionId, onBack }: SessionDetailProps) {
         mode={session.mode}
         running={running}
         roster={roster}
+        mentionTargetId={mentionTargetId}
+        onMentionTargetChange={setMentionTargetId}
         onModeChange={handleModeChange}
         onSend={handleSend}
       />

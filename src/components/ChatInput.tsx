@@ -6,6 +6,8 @@ interface ChatInputProps {
   mode: SessionMode;
   running: boolean;
   roster: Agent[];
+  mentionTargetId: string | null;
+  onMentionTargetChange: (agentId: string) => void;
   onModeChange: (mode: SessionMode) => void;
   onSend: (text: string) => void;
 }
@@ -17,20 +19,29 @@ const modeButtonClass = (active: boolean) =>
 /**
  * Message box with the two mode buttons inside it. "小组发言" (sequential)
  * is the default; "点名发言" (mention) expands the session's agents so one
- * can be picked, and clicking "小组发言" again switches back. Mention mode's
- * turn-taking isn't implemented yet, so sending is disabled while it's on.
+ * can be picked, and clicking "小组发言" again switches back. The picked
+ * agent (and mode) are owned by the parent, so they survive re-renders and
+ * carry over to the next round unless the user changes them.
  */
-export function ChatInput({ mode, running, roster, onModeChange, onSend }: ChatInputProps) {
+export function ChatInput({
+  mode,
+  running,
+  roster,
+  mentionTargetId,
+  onMentionTargetChange,
+  onModeChange,
+  onSend,
+}: ChatInputProps) {
   const [text, setText] = useState("");
-  const [mentionTargetId, setMentionTargetId] = useState<string | null>(null);
 
   const mentionMode = mode === "mention";
+  const mentionTargetValid = mentionTargetId !== null && roster.some((a) => a.id === mentionTargetId);
   const blockedReason = running
     ? "本轮进行中，请等待所有 Agent 发言完毕"
     : roster.length === 0
       ? "名单里还没有 Agent，先在上方“管理名单”里添加"
-      : mentionMode
-        ? "点名发言的对话逻辑尚未实现，请切换回小组发言"
+      : mentionMode && !mentionTargetValid
+        ? "请先选择点名对象"
         : null;
   const canSend = blockedReason === null && text.trim() !== "";
 
@@ -58,7 +69,7 @@ export function ChatInput({ mode, running, roster, onModeChange, onSend }: ChatI
             <button
               key={agent.id}
               type="button"
-              onClick={() => setMentionTargetId(agent.id)}
+              onClick={() => onMentionTargetChange(agent.id)}
               className={
                 "flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs " +
                 (mentionTargetId === agent.id

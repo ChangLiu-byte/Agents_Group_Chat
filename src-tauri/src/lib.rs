@@ -49,6 +49,7 @@ pub fn run() {
             commands::session::delete_session,
             commands::chat::list_messages,
             commands::chat::run_sequential_round,
+            commands::chat::run_mention_round,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
