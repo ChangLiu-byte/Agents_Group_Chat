@@ -23,6 +23,19 @@ export interface Message {
   refers_to: string | null;
   /** Unix timestamp (seconds since epoch). */
   created_at: number;
+  /** Images attached to this message (only ever on user messages). */
+  attachments: Attachment[];
+}
+
+/** Keep in sync with the `Attachment` struct in `src-tauri/src/attachment.rs`. */
+export interface Attachment {
+  id: string;
+  message_id: string;
+  /** Relative to `<app data dir>/attachments`. */
+  file_path: string;
+  mime_type: string;
+  /** Unix timestamp (seconds since epoch). */
+  created_at: number;
 }
 
 /** Payload of the `agent-error` event (see `commands/chat.rs`). */

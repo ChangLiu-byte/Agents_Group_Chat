@@ -104,5 +104,46 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
     .await
     .map_err(|e| e.to_string())?;
 
+    // Phase 5: per-agent vision flag. `ADD COLUMN` isn't idempotent in
+    // SQLite (a second launch would fail with "duplicate column name"), so
+    // only run it when the column is actually missing. Defaults to 1 since
+    // every model configured so far accepts images.
+    let has_supports_vision: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('agents') WHERE name = 'supports_vision'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if !has_supports_vision {
+        sqlx::query("ALTER TABLE agents ADD COLUMN supports_vision INTEGER NOT NULL DEFAULT 1")
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Phase 5: images attached to (user) messages. Only the path relative to
+    // the attachments folder is stored - never the bytes.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS attachments (
+            id          TEXT PRIMARY KEY,
+            message_id  TEXT NOT NULL,
+            file_path   TEXT NOT NULL,
+            mime_type   TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            FOREIGN KEY (message_id) REFERENCES messages(id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Every turn looks attachments up by message, so index that.
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id)")
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
     Ok(())
 }

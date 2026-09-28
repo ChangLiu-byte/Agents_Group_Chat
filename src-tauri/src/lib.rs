@@ -1,4 +1,5 @@
 mod agent;
+mod attachment;
 mod commands;
 mod db;
 mod providers;

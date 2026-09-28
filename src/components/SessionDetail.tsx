@@ -12,6 +12,7 @@ import type {
 import { ChatInput } from "./ChatInput";
 import { MessageList, type ChatItem } from "./MessageList";
 import { SessionAgentRoster } from "./SessionAgentRoster";
+import { fileToImageUpload, type ImageUpload } from "../utils/image";
 
 interface SessionDetailProps {
   sessionId: string;
@@ -114,10 +115,17 @@ export function SessionDetail({ sessionId, onBack }: SessionDetailProps) {
     };
   }, [sessionId]);
 
-  async function handleSend(text: string) {
+  async function handleSend(text: string, files: File[]) {
     if (!session) return;
     if (session.mode === "mention" && !mentionTargetId) {
       setError("请先选择点名对象");
+      return;
+    }
+    let images: ImageUpload[];
+    try {
+      images = await Promise.all(files.map(fileToImageUpload));
+    } catch (e) {
+      setError(String(e));
       return;
     }
     setError(null);
@@ -128,9 +136,10 @@ export function SessionDetail({ sessionId, onBack }: SessionDetailProps) {
           sessionId,
           targetAgentId: mentionTargetId,
           userMessage: text,
+          images,
         });
       } else {
-        await invoke("run_sequential_round", { sessionId, userMessage: text });
+        await invoke("run_sequential_round", { sessionId, userMessage: text, images });
       }
     } catch (e) {
       setError(String(e));

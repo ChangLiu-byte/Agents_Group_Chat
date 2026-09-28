@@ -6,7 +6,7 @@
 //! whose text lives in `content[0].text` rather than
 //! `choices[0].message.content`.
 
-use super::{ChatMessage, ProviderError, Role};
+use super::{ChatMessage, ContentPart, ProviderError, Role};
 use serde::{Deserialize, Serialize};
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -19,7 +19,31 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 #[derive(Serialize)]
 struct RequestMessage<'a> {
     role: &'a str,
-    content: &'a str,
+    content: RequestContent<'a>,
+}
+
+/// A plain string for text-only messages (unchanged from before images were
+/// supported); an array of content blocks only when there's an image.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum RequestContent<'a> {
+    Text(String),
+    Blocks(Vec<RequestBlock<'a>>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RequestBlock<'a> {
+    Text { text: &'a str },
+    Image { source: ImageSource<'a> },
+}
+
+#[derive(Serialize)]
+struct ImageSource<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: &'a str,
+    data: &'a str,
 }
 
 #[derive(Serialize)]
@@ -54,6 +78,31 @@ fn role_str(role: Role) -> &'static str {
     }
 }
 
+fn request_content(message: &ChatMessage) -> RequestContent<'_> {
+    if !message.has_image() {
+        return RequestContent::Text(message.joined_text());
+    }
+    RequestContent::Blocks(
+        message
+            .content
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text(text) => RequestBlock::Text { text },
+                ContentPart::Image {
+                    mime_type,
+                    base64_data,
+                } => RequestBlock::Image {
+                    source: ImageSource {
+                        kind: "base64",
+                        media_type: mime_type,
+                        data: base64_data,
+                    },
+                },
+            })
+            .collect(),
+    )
+}
+
 pub async fn send(
     client: &reqwest::Client,
     model: &str,
@@ -72,7 +121,7 @@ pub async fn send(
         .iter()
         .map(|m| RequestMessage {
             role: role_str(m.role),
-            content: &m.content,
+            content: request_content(m),
         })
         .collect();
 
@@ -117,4 +166,37 @@ pub async fn send(
         ));
     }
     Ok(text.join("\n\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn text_only_message_stays_a_plain_string() {
+        let m = ChatMessage::text(Role::User, "hi");
+        assert_eq!(serde_json::to_value(request_content(&m)).unwrap(), json!("hi"));
+    }
+
+    #[test]
+    fn message_with_image_becomes_content_blocks() {
+        let m = ChatMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::Text("look".into()),
+                ContentPart::Image {
+                    mime_type: "image/webp".into(),
+                    base64_data: "AAAA".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            serde_json::to_value(request_content(&m)).unwrap(),
+            json!([
+                {"type": "text", "text": "look"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/webp", "data": "AAAA"}}
+            ])
+        );
+    }
 }

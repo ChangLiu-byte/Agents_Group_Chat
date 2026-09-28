@@ -1,3 +1,4 @@
+use crate::attachment::Attachment;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,4 +44,9 @@ pub struct Message {
     pub refers_to: Option<String>,
     /// Unix timestamp (seconds since epoch).
     pub created_at: i64,
+    /// Images attached to this message. Not a column of `messages` - filled
+    /// in from the `attachments` table after the row is loaded.
+    #[sqlx(skip)]
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }

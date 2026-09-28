@@ -13,8 +13,8 @@ pub async fn add_agent(
 ) -> Result<(), String> {
     sqlx::query(
         r#"
-        INSERT INTO agents (id, name, provider, model, system_prompt, temperature, color, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO agents (id, name, provider, model, system_prompt, temperature, color, created_at, supports_vision)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&agent.id)
@@ -25,6 +25,7 @@ pub async fn add_agent(
     .bind(agent.temperature)
     .bind(&agent.color)
     .bind(agent.created_at)
+    .bind(agent.supports_vision)
     .execute(pool.inner())
     .await
     .map_err(|e| e.to_string())?;
@@ -40,7 +41,7 @@ pub async fn add_agent(
 pub async fn list_agents(pool: State<'_, SqlitePool>) -> Result<Vec<Agent>, String> {
     sqlx::query_as::<_, Agent>(
         r#"
-        SELECT id, name, provider, model, system_prompt, temperature, color, created_at
+        SELECT id, name, provider, model, system_prompt, temperature, color, created_at, supports_vision
         FROM agents
         ORDER BY created_at ASC
         "#,
@@ -62,7 +63,8 @@ pub async fn update_agent(
     sqlx::query(
         r#"
         UPDATE agents
-        SET name = ?, provider = ?, model = ?, system_prompt = ?, temperature = ?, color = ?
+        SET name = ?, provider = ?, model = ?, system_prompt = ?, temperature = ?, color = ?,
+            supports_vision = ?
         WHERE id = ?
         "#,
     )
@@ -72,6 +74,7 @@ pub async fn update_agent(
     .bind(&agent.system_prompt)
     .bind(agent.temperature)
     .bind(&agent.color)
+    .bind(agent.supports_vision)
     .bind(&agent.id)
     .execute(pool.inner())
     .await
@@ -112,7 +115,7 @@ pub async fn test_agent_message(
 ) -> Result<String, String> {
     let agent = sqlx::query_as::<_, Agent>(
         r#"
-        SELECT id, name, provider, model, system_prompt, temperature, color, created_at
+        SELECT id, name, provider, model, system_prompt, temperature, color, created_at, supports_vision
         FROM agents
         WHERE id = ?
         "#,
@@ -125,10 +128,7 @@ pub async fn test_agent_message(
 
     let api_key = agent::load_api_key(&agent.id)?;
 
-    let messages = [ChatMessage {
-        role: Role::User,
-        content: user_message,
-    }];
+    let messages = [ChatMessage::text(Role::User, user_message)];
 
     providers::send_chat_message(
         client.inner(),

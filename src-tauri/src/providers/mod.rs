@@ -15,10 +15,48 @@ pub enum Role {
     Assistant,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One piece of a message's content. A message is usually a single `Text`
+/// part; user messages with attached images add one `Image` part per image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentPart {
+    Text(String),
+    Image { mime_type: String, base64_data: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: Role,
-    pub content: String,
+    pub content: Vec<ContentPart>,
+}
+
+impl ChatMessage {
+    /// A message consisting of one text part.
+    pub fn text(role: Role, text: impl Into<String>) -> Self {
+        ChatMessage {
+            role,
+            content: vec![ContentPart::Text(text.into())],
+        }
+    }
+
+    pub fn has_image(&self) -> bool {
+        self.content
+            .iter()
+            .any(|p| matches!(p, ContentPart::Image { .. }))
+    }
+
+    /// All text parts joined - what a text-only message is sent as, so
+    /// messages without images keep the plain-string `content` shape every
+    /// provider (including non-vision models) accepts.
+    pub fn joined_text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.as_str()),
+                ContentPart::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 /// Everything that can go wrong while talking to a provider's HTTP API.

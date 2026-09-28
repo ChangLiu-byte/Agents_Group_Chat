@@ -163,7 +163,8 @@ pub async fn list_session_agents(
 pub(crate) async fn fetch_roster(pool: &SqlitePool, session_id: &str) -> Result<Vec<Agent>, String> {
     sqlx::query_as::<_, Agent>(
         r#"
-        SELECT a.id, a.name, a.provider, a.model, a.system_prompt, a.temperature, a.color, a.created_at
+        SELECT a.id, a.name, a.provider, a.model, a.system_prompt, a.temperature, a.color, a.created_at,
+               a.supports_vision
         FROM session_agents sa
         JOIN agents a ON a.id = sa.agent_id
         WHERE sa.session_id = ?
@@ -199,7 +200,15 @@ pub async fn delete_session(
     }
 
     // SQLite foreign keys aren't enforced (and have no ON DELETE CASCADE in
-    // the schema), so children are deleted explicitly, child-first.
+    // the schema), so children are deleted explicitly, child-first. The
+    // image files themselves are deliberately left on disk.
+    sqlx::query(
+        "DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?)",
+    )
+    .bind(&session_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
     sqlx::query("DELETE FROM messages WHERE session_id = ?")
         .bind(&session_id)
         .execute(&mut *tx)

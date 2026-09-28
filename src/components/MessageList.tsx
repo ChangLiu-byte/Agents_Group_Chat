@@ -1,6 +1,7 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Agent } from "../types/agent";
-import type { AgentErrorEvent, Message } from "../types/session";
+import type { AgentErrorEvent, Attachment, Message } from "../types/session";
+import { AttachmentImage } from "./AttachmentImage";
 
 /** One entry of the chat timeline, in arrival order. Errors are live-only
  * (never stored), so they only exist for the current view. */
@@ -18,6 +19,7 @@ const REMOVED_AGENT_NAME = "已移除的 Agent";
 
 export function MessageList({ items, agentsById, running }: MessageListProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [viewing, setViewing] = useState<Attachment | null>(null);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -50,7 +52,7 @@ export function MessageList({ items, agentsById, running }: MessageListProps) {
               </div>
             )}
             {item.kind === "message" ? (
-              <MessageBubble message={item.message} agentsById={agentsById} />
+              <MessageBubble message={item.message} agentsById={agentsById} onOpenImage={setViewing} />
             ) : (
               <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
                 <span className="font-medium">{item.error.agent_name}</span> 这一轮没有回复：
@@ -62,6 +64,15 @@ export function MessageList({ items, agentsById, running }: MessageListProps) {
       })}
 
       {running && <p className="text-sm text-slate-400">本轮进行中，Agent 依次发言…</p>}
+
+      {viewing && (
+        <div
+          className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/80 p-6"
+          onClick={() => setViewing(null)}
+        >
+          <AttachmentImage attachment={viewing} className="max-h-full max-w-full rounded-md object-contain" />
+        </div>
+      )}
     </div>
   );
 }
@@ -69,9 +80,11 @@ export function MessageList({ items, agentsById, running }: MessageListProps) {
 function MessageBubble({
   message,
   agentsById,
+  onOpenImage,
 }: {
   message: Message;
   agentsById: Map<string, Agent>;
+  onOpenImage: (attachment: Attachment) => void;
 }) {
   if (message.agent_id === null) {
     const mentionedAgent = message.refers_to ? agentsById.get(message.refers_to) : undefined;
@@ -82,9 +95,23 @@ function MessageBubble({
             → 点名 {mentionedAgent?.name ?? REMOVED_AGENT_NAME}
           </p>
         )}
-        <div className="max-w-[80%] rounded-lg bg-indigo-600 px-3 py-2 text-sm text-white whitespace-pre-wrap break-words">
-          {message.content}
-        </div>
+        {message.content !== "" && (
+          <div className="max-w-[80%] rounded-lg bg-indigo-600 px-3 py-2 text-sm text-white whitespace-pre-wrap break-words">
+            {message.content}
+          </div>
+        )}
+        {message.attachments.length > 0 && (
+          <div className="mt-1.5 flex max-w-[80%] flex-wrap justify-end gap-1.5">
+            {message.attachments.map((attachment) => (
+              <AttachmentImage
+                key={attachment.id}
+                attachment={attachment}
+                onClick={() => onOpenImage(attachment)}
+                className="h-32 w-32 cursor-zoom-in rounded-md border border-slate-200 object-cover"
+              />
+            ))}
+          </div>
+        )}
       </div>
     );
   }

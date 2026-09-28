@@ -1,10 +1,12 @@
 use super::session::{fetch_roster, fetch_session};
 use crate::agent::{self, Agent};
-use crate::providers::{self, ChatMessage, Role};
+use crate::attachment::{self, Attachment, ImageUpload, ValidatedImage};
+use crate::providers::{self, ChatMessage, ContentPart, Role};
 use crate::session::{now_unix, Message};
 use serde::Serialize;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::path::Path;
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
@@ -13,6 +15,23 @@ use uuid::Uuid;
 const USER_LABEL: &str = "User";
 /// Label for a message whose author has since been deleted from `agents`.
 const REMOVED_AGENT_LABEL: &str = "已移除的Agent";
+
+/// Appended to a message's text, in place of its images, for an agent whose
+/// model can't take image input - so it can say it can't see the image
+/// instead of silently ignoring it. "如与讨论相关" keeps it from re-announcing
+/// the limitation every round, since old images stay in the history.
+fn no_vision_note(image_count: usize) -> String {
+    format!(
+        "[注意：此消息附带了 {image_count} 张图片，但你不具备图片识别能力，无法看到图片内容。\
+         如与讨论相关，请在回复中说明这一局限，并仅根据文字内容回应。]"
+    )
+}
+
+/// Appended to a message's text when some of its image files could no
+/// longer be read (e.g. deleted from the app data folder by hand).
+fn missing_images_note(missing_count: usize) -> String {
+    format!("[{missing_count} 张图片已丢失，无法加载]")
+}
 
 /// Appended to each agent's own system prompt while the session is in
 /// sequential ("小组发言") mode, so replies stay short enough to read as a
@@ -67,11 +86,12 @@ fn emit_event<S: Serialize + Clone>(app: &AppHandle, event: &str, payload: S) {
     }
 }
 
+/// The session's messages in order, each with its `attachments` filled in.
 async fn fetch_messages(pool: &SqlitePool, session_id: &str) -> Result<Vec<Message>, String> {
     // `created_at` only has one-second resolution and a round produces
     // several messages within a second, so `rowid` (insertion order) breaks
     // the ties.
-    sqlx::query_as::<_, Message>(
+    let mut messages = sqlx::query_as::<_, Message>(
         r#"
         SELECT id, session_id, agent_id, round_number, content, refers_to, created_at
         FROM messages
@@ -82,7 +102,35 @@ async fn fetch_messages(pool: &SqlitePool, session_id: &str) -> Result<Vec<Messa
     .bind(session_id)
     .fetch_all(pool)
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+
+    // One query for the whole session's attachments rather than one per
+    // message.
+    let attachments = sqlx::query_as::<_, Attachment>(
+        r#"
+        SELECT a.id, a.message_id, a.file_path, a.mime_type, a.created_at
+        FROM attachments a
+        JOIN messages m ON m.id = a.message_id
+        WHERE m.session_id = ?
+        ORDER BY a.created_at ASC, a.rowid ASC
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut by_message: HashMap<String, Vec<Attachment>> = HashMap::new();
+    for a in attachments {
+        by_message.entry(a.message_id.clone()).or_default().push(a);
+    }
+    for m in &mut messages {
+        if let Some(list) = by_message.remove(&m.id) {
+            m.attachments = list;
+        }
+    }
+
+    Ok(messages)
 }
 
 /// Full message history of a session in order - loaded when a session is
@@ -95,14 +143,19 @@ pub async fn list_messages(
     fetch_messages(pool.inner(), &session_id).await
 }
 
-async fn insert_message(
-    pool: &SqlitePool,
+/// Generic over the executor so it can run either directly on the pool or
+/// inside the transaction of [`insert_user_message`].
+async fn insert_message<'e, E>(
+    executor: E,
     session_id: &str,
     agent_id: Option<&str>,
     round_number: i64,
     content: &str,
     refers_to: Option<&str>,
-) -> Result<Message, String> {
+) -> Result<Message, String>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let message = Message {
         id: Uuid::new_v4().to_string(),
         session_id: session_id.to_string(),
@@ -111,6 +164,7 @@ async fn insert_message(
         content: content.to_string(),
         refers_to: refers_to.map(str::to_string),
         created_at: now_unix(),
+        attachments: Vec::new(),
     };
 
     sqlx::query(
@@ -126,11 +180,159 @@ async fn insert_message(
     .bind(&message.content)
     .bind(&message.refers_to)
     .bind(message.created_at)
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(|e| e.to_string())?;
 
     Ok(message)
+}
+
+/// Store the user's message that opens a round, together with its images:
+/// files are written first, then the message row and all attachment rows go
+/// in one transaction. If anything fails, the files just written are removed
+/// again so no orphans are left behind.
+async fn insert_user_message(
+    ctx: &RoundCtx<'_>,
+    round_number: i64,
+    content: &str,
+    refers_to: Option<&str>,
+    images: &[ValidatedImage],
+) -> Result<Message, String> {
+    let mut saved: Vec<String> = Vec::with_capacity(images.len());
+    for image in images {
+        match attachment::save_image(ctx.attachments_dir, image) {
+            Ok(relative) => saved.push(relative),
+            Err(e) => {
+                attachment::remove_images(ctx.attachments_dir, &saved);
+                return Err(format!("保存图片失败：{e}"));
+            }
+        }
+    }
+
+    let result: Result<Message, String> = async {
+        let mut tx = ctx.pool.begin().await.map_err(|e| e.to_string())?;
+        let mut message = insert_message(
+            &mut *tx,
+            ctx.session_id,
+            None,
+            round_number,
+            content,
+            refers_to,
+        )
+        .await?;
+
+        for (image, relative) in images.iter().zip(&saved) {
+            let row = Attachment {
+                id: Uuid::new_v4().to_string(),
+                message_id: message.id.clone(),
+                file_path: relative.clone(),
+                mime_type: image.mime_type.to_string(),
+                created_at: message.created_at,
+            };
+            sqlx::query(
+                r#"
+                INSERT INTO attachments (id, message_id, file_path, mime_type, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&row.id)
+            .bind(&row.message_id)
+            .bind(&row.file_path)
+            .bind(&row.mime_type)
+            .bind(row.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+            message.attachments.push(row);
+        }
+
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(message)
+    }
+    .await;
+
+    if result.is_err() {
+        attachment::remove_images(ctx.attachments_dir, &saved);
+    }
+    result
+}
+
+/// Validate every uploaded image up front, before the session is claimed,
+/// so a bad file is a plain error rather than a half-started round.
+fn validate_images(images: Option<Vec<ImageUpload>>) -> Result<Vec<ValidatedImage>, String> {
+    images
+        .unwrap_or_default()
+        .iter()
+        .map(attachment::validate_upload)
+        .collect()
+}
+
+/// Read and base64-encode every image in `history`, keyed by attachment id.
+/// Skipped entirely for an agent without vision (it never gets image data).
+/// A file that can't be read is left out of the map, which
+/// [`build_history_for`] turns into a "missing image" note rather than
+/// failing the whole turn.
+fn load_images(
+    attachments_dir: &Path,
+    supports_vision: bool,
+    history: &[Message],
+) -> HashMap<String, ContentPart> {
+    if !supports_vision {
+        return HashMap::new();
+    }
+    history
+        .iter()
+        .flat_map(|m| &m.attachments)
+        .filter_map(|a| match attachment::load_image_base64(attachments_dir, &a.file_path) {
+            Ok(base64_data) => Some((
+                a.id.clone(),
+                ContentPart::Image {
+                    mime_type: a.mime_type.clone(),
+                    base64_data,
+                },
+            )),
+            Err(e) => {
+                eprintln!("failed to load attachment \"{}\": {e}", a.file_path);
+                None
+            }
+        })
+        .collect()
+}
+
+/// Combine a message's (already labelled) text with its attachments:
+/// - no attachments -> a single text part, as before;
+/// - vision agent -> text part followed by one image part per image, plus a
+///   note for any image whose file couldn't be loaded;
+/// - non-vision agent -> text only, with a note that images were attached.
+fn with_attachments(
+    role: Role,
+    mut text: String,
+    attachments: &[Attachment],
+    supports_vision: bool,
+    images: &HashMap<String, ContentPart>,
+) -> ChatMessage {
+    if attachments.is_empty() {
+        return ChatMessage::text(role, text);
+    }
+    if !supports_vision {
+        text.push('\n');
+        text.push_str(&no_vision_note(attachments.len()));
+        return ChatMessage::text(role, text);
+    }
+
+    let image_parts: Vec<ContentPart> = attachments
+        .iter()
+        .filter_map(|a| images.get(&a.id).cloned())
+        .collect();
+    let missing = attachments.len() - image_parts.len();
+    if missing > 0 {
+        text.push('\n');
+        text.push_str(&missing_images_note(missing));
+    }
+
+    let mut content = vec![ContentPart::Text(text)];
+    content.extend(image_parts);
+    ChatMessage { role, content }
 }
 
 /// Turn the session transcript into the `ChatMessage` list for the agent
@@ -140,32 +342,31 @@ async fn insert_message(
 /// - Everything else (the user, every other agent) -> `user`, with the
 ///   content prefixed by the speaker's label: `[User]: ...` for the user,
 ///   `[<agent name>]: ...` for another agent.
+/// - Attached images are included, or replaced by a note, depending on
+///   `supports_vision` (see [`with_attachments`]); `images` is the output of
+///   [`load_images`].
 fn build_history_for(
     current_agent_id: &str,
     messages: &[Message],
     agent_names: &HashMap<String, String>,
+    supports_vision: bool,
+    images: &HashMap<String, ContentPart>,
 ) -> Vec<ChatMessage> {
     messages
         .iter()
-        .map(|m| match m.agent_id.as_deref() {
-            Some(id) if id == current_agent_id => ChatMessage {
-                role: Role::Assistant,
-                content: m.content.clone(),
-            },
-            Some(id) => {
-                let label = agent_names
-                    .get(id)
-                    .map(String::as_str)
-                    .unwrap_or(REMOVED_AGENT_LABEL);
-                ChatMessage {
-                    role: Role::User,
-                    content: format!("[{label}]: {}", m.content),
+        .map(|m| {
+            let (role, text) = match m.agent_id.as_deref() {
+                Some(id) if id == current_agent_id => (Role::Assistant, m.content.clone()),
+                Some(id) => {
+                    let label = agent_names
+                        .get(id)
+                        .map(String::as_str)
+                        .unwrap_or(REMOVED_AGENT_LABEL);
+                    (Role::User, format!("[{label}]: {}", m.content))
                 }
-            }
-            None => ChatMessage {
-                role: Role::User,
-                content: format!("[{USER_LABEL}]: {}", m.content),
-            },
+                None => (Role::User, format!("[{USER_LABEL}]: {}", m.content)),
+            };
+            with_attachments(role, text, &m.attachments, supports_vision, images)
         })
         .collect()
 }
@@ -185,18 +386,25 @@ fn strip_self_label(reply: &str, agent_name: &str) -> String {
 }
 
 async fn generate_reply(
-    client: &reqwest::Client,
+    ctx: &RoundCtx<'_>,
     agent: &Agent,
     mode: &str,
     history: &[Message],
     agent_names: &HashMap<String, String>,
 ) -> Result<String, String> {
     let api_key = agent::load_api_key(&agent.id)?;
-    let chat_messages = build_history_for(&agent.id, history, agent_names);
+    let images = load_images(ctx.attachments_dir, agent.supports_vision, history);
+    let chat_messages = build_history_for(
+        &agent.id,
+        history,
+        agent_names,
+        agent.supports_vision,
+        &images,
+    );
     let system_prompt = effective_system_prompt(agent, mode);
 
     let reply = providers::send_chat_message(
-        client,
+        ctx.client,
         &agent.provider,
         &agent.model,
         system_prompt.as_deref(),
@@ -276,6 +484,7 @@ struct RoundCtx<'a> {
     client: &'a reqwest::Client,
     app: &'a AppHandle,
     session_id: &'a str,
+    attachments_dir: &'a Path,
 }
 
 /// One agent's turn: read the latest history, ask it for a reply, and
@@ -291,7 +500,7 @@ async fn run_one_turn(
 ) -> Result<(), String> {
     let history = fetch_messages(ctx.pool, ctx.session_id).await?;
 
-    match generate_reply(ctx.client, agent, mode, &history, agent_names).await {
+    match generate_reply(ctx, agent, mode, &history, agent_names).await {
         Ok(reply) => {
             let row = insert_message(
                 ctx.pool,
@@ -336,11 +545,14 @@ pub async fn run_sequential_round(
     app_handle: AppHandle,
     session_id: String,
     user_message: String,
+    images: Option<Vec<ImageUpload>>,
 ) -> Result<(), String> {
+    let images = validate_images(images)?;
     let user_message = user_message.trim();
-    if user_message.is_empty() {
+    if user_message.is_empty() && images.is_empty() {
         return Err("message is empty".to_string());
     }
+    let attachments_dir = attachment::attachments_dir(&app_handle)?;
 
     let pool = pool.inner();
     let client = client.inner();
@@ -364,12 +576,12 @@ pub async fn run_sequential_round(
         client,
         app: &app_handle,
         session_id: &session_id,
+        attachments_dir: &attachments_dir,
     };
 
     let outcome: Result<(), String> = async {
         let round_number = next_round_number(pool, &session_id).await?;
-        let user_row =
-            insert_message(pool, &session_id, None, round_number, user_message, None).await?;
+        let user_row = insert_user_message(&ctx, round_number, user_message, None, &images).await?;
         emit_event(&app_handle, "message-added", &user_row);
 
         let agent_names = fetch_agent_names(pool).await?;
@@ -416,11 +628,14 @@ pub async fn run_mention_round(
     session_id: String,
     target_agent_id: String,
     user_message: String,
+    images: Option<Vec<ImageUpload>>,
 ) -> Result<(), String> {
+    let images = validate_images(images)?;
     let user_message = user_message.trim();
-    if user_message.is_empty() {
+    if user_message.is_empty() && images.is_empty() {
         return Err("message is empty".to_string());
     }
+    let attachments_dir = attachment::attachments_dir(&app_handle)?;
 
     let pool = pool.inner();
     let client = client.inner();
@@ -442,19 +657,13 @@ pub async fn run_mention_round(
         client,
         app: &app_handle,
         session_id: &session_id,
+        attachments_dir: &attachments_dir,
     };
 
     let outcome: Result<(), String> = async {
         let round_number = next_round_number(pool, &session_id).await?;
-        let user_row = insert_message(
-            pool,
-            &session_id,
-            None,
-            round_number,
-            user_message,
-            Some(&target.id),
-        )
-        .await?;
+        let user_row =
+            insert_user_message(&ctx, round_number, user_message, Some(&target.id), &images).await?;
         emit_event(&app_handle, "message-added", &user_row);
 
         let agent_names = fetch_agent_names(pool).await?;
@@ -491,6 +700,40 @@ mod tests {
             content: content.into(),
             refers_to: None,
             created_at: 0,
+            attachments: Vec::new(),
+        }
+    }
+
+    fn with_images(mut m: Message, ids: &[&str]) -> Message {
+        m.attachments = ids
+            .iter()
+            .map(|id| Attachment {
+                id: (*id).into(),
+                message_id: m.id.clone(),
+                file_path: format!("{id}.png"),
+                mime_type: "image/png".into(),
+                created_at: 0,
+            })
+            .collect();
+        m
+    }
+
+    fn image(data: &str) -> ContentPart {
+        ContentPart::Image {
+            mime_type: "image/png".into(),
+            base64_data: data.into(),
+        }
+    }
+
+    /// History for `agent_id` with no images loaded - the text-only case.
+    fn history_for(agent_id: &str, messages: &[Message]) -> Vec<ChatMessage> {
+        build_history_for(agent_id, messages, &names(), true, &HashMap::new())
+    }
+
+    fn text_of(m: &ChatMessage) -> &str {
+        match m.content.as_slice() {
+            [ContentPart::Text(t), ..] => t,
+            other => panic!("expected a leading text part, got {other:?}"),
         }
     }
 
@@ -504,6 +747,7 @@ mod tests {
             temperature: 0.7,
             color: None,
             created_at: 0,
+            supports_vision: true,
         }
     }
 
@@ -517,35 +761,81 @@ mod tests {
     #[test]
     fn own_messages_are_assistant_and_unprefixed() {
         let history = [msg(None, "topic?"), msg(Some("a1"), "my take")];
-        let out = build_history_for("a1", &history, &names());
-        assert_eq!(out[1].role, Role::Assistant);
-        assert_eq!(out[1].content, "my take");
+        let out = history_for("a1", &history);
+        assert_eq!(out[1], ChatMessage::text(Role::Assistant, "my take"));
     }
 
     #[test]
     fn user_and_other_agents_are_user_role_with_labels() {
         let history = [msg(None, "topic?"), msg(Some("a1"), "alice says"), msg(Some("a2"), "bob says")];
-        let out = build_history_for("a2", &history, &names());
-        assert_eq!(out[0].role, Role::User);
-        assert_eq!(out[0].content, "[User]: topic?");
-        assert_eq!(out[1].role, Role::User);
-        assert_eq!(out[1].content, "[Alice]: alice says");
-        assert_eq!(out[2].role, Role::Assistant);
-        assert_eq!(out[2].content, "bob says");
+        let out = history_for("a2", &history);
+        assert_eq!(out[0], ChatMessage::text(Role::User, "[User]: topic?"));
+        assert_eq!(out[1], ChatMessage::text(Role::User, "[Alice]: alice says"));
+        assert_eq!(out[2], ChatMessage::text(Role::Assistant, "bob says"));
     }
 
     #[test]
     fn unknown_author_gets_fallback_label() {
         let history = [msg(Some("gone"), "hello")];
-        let out = build_history_for("a1", &history, &names());
-        assert_eq!(out[0].content, format!("[{REMOVED_AGENT_LABEL}]: hello"));
+        let out = history_for("a1", &history);
+        assert_eq!(text_of(&out[0]), format!("[{REMOVED_AGENT_LABEL}]: hello"));
+    }
+
+    #[test]
+    fn vision_agent_gets_text_then_images() {
+        let history = [with_images(msg(None, "look"), &["i1", "i2"])];
+        let images = HashMap::from([("i1".to_string(), image("AAA")), ("i2".to_string(), image("BBB"))]);
+        let out = build_history_for("a1", &history, &names(), true, &images);
+        assert_eq!(
+            out[0].content,
+            vec![ContentPart::Text("[User]: look".into()), image("AAA"), image("BBB")]
+        );
+    }
+
+    #[test]
+    fn non_vision_agent_gets_a_note_instead_of_images() {
+        let history = [with_images(msg(None, "look"), &["i1", "i2"])];
+        // Even if image data were somehow loaded, it must not be sent.
+        let images = HashMap::from([("i1".to_string(), image("AAA"))]);
+        let out = build_history_for("a1", &history, &names(), false, &images);
+        assert!(!out[0].has_image());
+        assert_eq!(out[0].content.len(), 1);
+        assert!(text_of(&out[0]).starts_with("[User]: look\n"));
+        assert!(text_of(&out[0]).contains("附带了 2 张图片"));
+    }
+
+    #[test]
+    fn missing_image_file_becomes_a_note_not_an_error() {
+        let history = [with_images(msg(None, "look"), &["i1", "gone"])];
+        let images = HashMap::from([("i1".to_string(), image("AAA"))]);
+        let out = build_history_for("a1", &history, &names(), true, &images);
+        assert_eq!(out[0].content.len(), 2);
+        assert!(text_of(&out[0]).contains("1 张图片已丢失，无法加载"));
+        assert_eq!(out[0].content[1], image("AAA"));
+    }
+
+    #[test]
+    fn messages_without_attachments_are_the_same_either_way() {
+        let history = [msg(None, "topic?"), msg(Some("a2"), "bob says")];
+        let with_vision = build_history_for("a1", &history, &names(), true, &HashMap::new());
+        let without = build_history_for("a1", &history, &names(), false, &HashMap::new());
+        assert_eq!(with_vision, without);
+    }
+
+    #[test]
+    fn image_only_user_message_still_has_its_label() {
+        let history = [with_images(msg(None, ""), &["i1"])];
+        let images = HashMap::from([("i1".to_string(), image("AAA"))]);
+        let out = build_history_for("a1", &history, &names(), true, &images);
+        assert_eq!(text_of(&out[0]), "[User]: ");
+        assert!(out[0].has_image());
     }
 
     #[test]
     fn sequential_mode_appends_guidelines_after_existing_prompt() {
         let result = effective_system_prompt(&agent(Some("You are a pirate.")), "sequential").unwrap();
         assert!(result.starts_with("You are a pirate.\n\n"));
-        assert!(result.contains("group discussion round"));
+        assert!(result.contains("当前处于小组讨论轮次"));
     }
 
     #[test]
@@ -573,6 +863,7 @@ mod tests {
             temperature: 0.7,
             color: None,
             created_at: 0,
+            supports_vision: true,
         }
     }
 

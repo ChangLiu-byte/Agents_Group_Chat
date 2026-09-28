@@ -44,6 +44,7 @@ export function AgentsPage() {
           system_prompt: values.system_prompt || null,
           temperature: values.temperature,
           color: values.color || null,
+          supports_vision: values.supports_vision,
           created_at: formMode.agent.created_at,
         };
         await invoke("update_agent", {
@@ -59,6 +60,7 @@ export function AgentsPage() {
           system_prompt: values.system_prompt || null,
           temperature: values.temperature,
           color: values.color || null,
+          supports_vision: values.supports_vision,
           created_at: Math.floor(Date.now() / 1000),
         };
         await invoke("add_agent", { agent, apiKey: values.api_key });

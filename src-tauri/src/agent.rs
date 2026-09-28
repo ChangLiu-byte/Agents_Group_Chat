@@ -17,6 +17,16 @@ pub struct Agent {
     pub color: Option<String>,
     /// Unix timestamp (seconds since epoch).
     pub created_at: i64,
+    /// Whether this agent's model accepts image input. Set by the user
+    /// rather than inferred from provider/model, since which models support
+    /// vision changes too often to hard-code. When false, images in the
+    /// history are replaced by a text note saying one was attached.
+    #[serde(default = "default_supports_vision")]
+    pub supports_vision: bool,
+}
+
+fn default_supports_vision() -> bool {
+    true
 }
 
 /// Service name under which all agent API keys are grouped in the OS

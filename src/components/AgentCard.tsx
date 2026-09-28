@@ -19,6 +19,11 @@ export function AgentCard({ agent, onEdit, onDelete }: AgentCardProps) {
           <p className="text-sm font-semibold text-slate-900">{agent.name}</p>
           <p className="text-xs text-slate-500">
             {agent.provider} · {agent.model}
+            {!agent.supports_vision && (
+              <span className="ml-2 rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-500">
+                不识图
+              </span>
+            )}
           </p>
         </div>
       </div>

@@ -147,6 +147,21 @@ export function AgentForm({
       </div>
 
       <div>
+        <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+          <input
+            type="checkbox"
+            className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+            checked={values.supports_vision}
+            onChange={(e) => update("supports_vision", e.target.checked)}
+          />
+          支持图片识别
+        </label>
+        <p className="mt-1 text-xs text-slate-500">
+          取消勾选后，该 Agent 不会收到图片本身，只会收到"此消息附带了图片但你看不到"的文字提示。
+        </p>
+      </div>
+
+      <div>
         <label className={labelClass} htmlFor="agent-system-prompt">
           System Prompt
         </label>

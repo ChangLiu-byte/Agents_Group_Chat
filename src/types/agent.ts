@@ -9,6 +9,8 @@ export interface Agent {
   color: string | null;
   /** Unix timestamp (seconds since epoch). */
   created_at: number;
+  /** Whether this agent's model accepts image input (set by the user). */
+  supports_vision: boolean;
 }
 
 export const PROVIDERS = ["openai", "anthropic", "deepseek", "qwen"] as const;
@@ -24,6 +26,7 @@ export interface AgentFormValues {
   temperature: number;
   color: string;
   api_key: string;
+  supports_vision: boolean;
 }
 
 export const DEFAULT_COLOR = "#6366f1";
@@ -38,6 +41,7 @@ export function emptyFormValues(): AgentFormValues {
     temperature: 0.7,
     color: DEFAULT_COLOR,
     api_key: "",
+    supports_vision: true,
   };
 }
 
@@ -51,5 +55,6 @@ export function agentToFormValues(agent: Agent): AgentFormValues {
     temperature: agent.temperature,
     color: agent.color ?? DEFAULT_COLOR,
     api_key: "",
+    supports_vision: agent.supports_vision,
   };
 }
