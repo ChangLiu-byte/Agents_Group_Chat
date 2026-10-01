@@ -45,20 +45,32 @@ const SEQUENTIAL_MODE_GUIDELINES: &str = "\
 - 不需要总结或复述问题本身
 - 如果这个问题需要展开详细论证，只需指出“这里有更深入的分析空间”，用户可以随后点名你详细展开";
 
-/// The system prompt actually sent for one turn: the agent's own prompt
-/// (unmodified) plus the sequential-mode guidelines, only while the session
-/// is in sequential mode. Mention mode's turn-taking isn't built yet, so
-/// this only ever fires today - but it's gated on `mode` rather than
-/// unconditional so it doesn't silently start applying there too once it
-/// is built.
-fn effective_system_prompt(agent: &Agent, mode: &str) -> Option<String> {
-    if mode != "sequential" {
-        return agent.system_prompt.clone();
+/// Tells the model which participant it is. Without this, models fall back
+/// to their built-in identity ("I'm Claude...") and even mistake the
+/// `[Name]: ...` lines of other agents - or their own configured name - for
+/// someone else's. Sent in every mode.
+fn identity_directive(agent_name: &str) -> String {
+    format!(
+        "你的名字是「{agent_name}」。在接下来的对话历史中，凡是标注为 [其他Agent名]: 的内容，\
+         都是群聊里其他参与者说的话，不是你自己说的；只有角色为 assistant 的历史消息才是你自己之前的发言。\
+         请始终记得自己的身份是「{agent_name}」，不要混淆自己和其他参与者。"
+    )
+}
+
+/// The system prompt actually sent for one turn, joined by blank lines:
+/// 1. the identity directive (always),
+/// 2. the agent's own prompt (unmodified, if it has one),
+/// 3. the sequential-mode guidelines, only while the session is in
+///    sequential mode.
+fn effective_system_prompt(agent: &Agent, mode: &str) -> String {
+    let mut sections = vec![identity_directive(&agent.name)];
+    if let Some(base) = agent.system_prompt.as_deref() {
+        sections.push(base.to_string());
     }
-    Some(match agent.system_prompt.as_deref() {
-        Some(base) => format!("{base}\n\n{SEQUENTIAL_MODE_GUIDELINES}"),
-        None => SEQUENTIAL_MODE_GUIDELINES.to_string(),
-    })
+    if mode == "sequential" {
+        sections.push(SEQUENTIAL_MODE_GUIDELINES.to_string());
+    }
+    sections.join("\n\n")
 }
 
 /// Payload of the `agent-error` event: one agent's turn failed, so the round
@@ -407,7 +419,7 @@ async fn generate_reply(
         ctx.client,
         &agent.provider,
         &agent.model,
-        system_prompt.as_deref(),
+        Some(&system_prompt),
         &chat_messages,
         &api_key,
         agent.temperature as f32,
@@ -832,25 +844,40 @@ mod tests {
     }
 
     #[test]
-    fn sequential_mode_appends_guidelines_after_existing_prompt() {
-        let result = effective_system_prompt(&agent(Some("You are a pirate.")), "sequential").unwrap();
-        assert!(result.starts_with("You are a pirate.\n\n"));
+    fn identity_directive_names_the_agent() {
+        let directive = identity_directive("衡臣");
+        assert!(directive.starts_with("你的名字是「衡臣」。"));
+        assert!(directive.contains("请始终记得自己的身份是「衡臣」"));
+    }
+
+    #[test]
+    fn sequential_mode_is_identity_then_own_prompt_then_guidelines() {
+        let result = effective_system_prompt(&agent(Some("You are a pirate.")), "sequential");
+        assert_eq!(
+            result,
+            format!(
+                "{}\n\nYou are a pirate.\n\n{SEQUENTIAL_MODE_GUIDELINES}",
+                identity_directive("Alice")
+            )
+        );
         assert!(result.contains("当前处于小组讨论轮次"));
     }
 
     #[test]
-    fn sequential_mode_with_no_own_prompt_is_just_the_guidelines() {
-        let result = effective_system_prompt(&agent(None), "sequential").unwrap();
-        assert_eq!(result, SEQUENTIAL_MODE_GUIDELINES);
+    fn sequential_mode_with_no_own_prompt_is_identity_and_guidelines() {
+        assert_eq!(
+            effective_system_prompt(&agent(None), "sequential"),
+            format!("{}\n\n{SEQUENTIAL_MODE_GUIDELINES}", identity_directive("Alice"))
+        );
     }
 
     #[test]
-    fn non_sequential_mode_leaves_the_prompt_untouched() {
+    fn mention_mode_has_identity_but_no_guidelines() {
         assert_eq!(
             effective_system_prompt(&agent(Some("You are a pirate.")), "mention"),
-            Some("You are a pirate.".to_string())
+            format!("{}\n\nYou are a pirate.", identity_directive("Alice"))
         );
-        assert_eq!(effective_system_prompt(&agent(None), "mention"), None);
+        assert_eq!(effective_system_prompt(&agent(None), "mention"), identity_directive("Alice"));
     }
 
     fn agent_with_id(id: &str, name: &str) -> Agent {
